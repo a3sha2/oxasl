@@ -52,7 +52,7 @@ def which(program):
     def is_exe(fpath):
         return os.path.isfile(fpath) and os.access(fpath, os.X_OK)
 
-    fpath, fname = os.path.split(program)
+    fpath, _fname = os.path.split(program)
     if fpath:
         if is_exe(program):
             return program
@@ -138,6 +138,7 @@ class LightboxImage(object):
 
             if self._img:
                 data = self._img.data[:, :, slice_idx].T
+                data[~np.isfinite(data)] = 0
 
                 if issubclass(data.dtype.type, np.integer):
                     cmap = "Reds"

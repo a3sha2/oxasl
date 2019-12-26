@@ -87,6 +87,11 @@ try:
 except ImportError:
     oxasl_surfpvc = None
 
+try:
+    import oxasl_multite
+except ImportError:
+    oxasl_multite = None
+
 from oxasl import Workspace, __version__, image, calib, struc, basil, mask, corrections, reg
 from oxasl.options import AslOptionParser, GenericOptions, OptionCategory, IgnorableOptionGroup
 from oxasl.reporting import LightboxImage
@@ -101,24 +106,35 @@ class OxfordAslOptions(OptionCategory):
 
     def groups(self, parser):
         ret = []
-        g = IgnorableOptionGroup(parser, "Main Options")
+        g = IgnorableOptionGroup(parser, "General Pipeline Options")
         g.add_option("--wp", help="Analysis which conforms to the 'white papers' (Alsop et al 2014)", action="store_true", default=False)
         g.add_option("--mc", help="Motion correct data", action="store_true", default=False)
-        g.add_option("--fixbat", dest="inferbat", help="Fix bolus arrival time", action="store_false", default=True)
-        g.add_option("--fixbolus", dest="infertau", help="Fix bolus duration", action="store_false")
-        g.add_option("--artoff", dest="inferart", help="Do not infer arterial component", action="store_false", default=True)
-        g.add_option("--spatial-off", dest="spatial", help="Do not include adaptive spatial smoothing on CBF", action="store_false", default=True)
-        g.add_option("--basil-options", "--fit-options", help="File containing additional options for model fitting step", type="optfile", default=None)
         if oxasl_enable:
             g.add_option("--use-enable", help="Use ENABLE preprocessing step", action="store_true", default=False)
+        ret.append(g)
 
+        g = IgnorableOptionGroup(parser, "Model fitting options")
+        g.add_option("--fixbat", dest="inferbat", help="Fix bolus arrival time", action="store_false", default=True)
+        g.add_option("--batsd", help="Bolus arrival time standard deviation (s) - default 1.0 for multi-PLD, 0.1 otherwise", type=float)
+        g.add_option("--fixbolus", "--fixtau", dest="infertau", help="Fix bolus duration", action="store_false")
+        g.add_option("--art-off", "--artoff", dest="inferart", help="Do not infer arterial component", action="store_false", default=True)
+        g.add_option("--spatial-off", "--spatialoff", dest="spatial", help="Do not include adaptive spatial smoothing on CBF", action="store_false", default=True)
+        g.add_option("--infertexch", help="Infer exchange time (multi-TE data only)", action="store_true", default=False)
+        g.add_option("--infert1", help="Infer T1 value", action="store_true", default=False)
+        g.add_option("--infert2", help="Infer T2 value (multi-TE data only)", action="store_true", default=False)
+        g.add_option("--basil-options", "--fit-options", help="File containing additional options for model fitting step", type="optfile", default=None)
         ret.append(g)
-        g = IgnorableOptionGroup(parser, "Acquisition/Data specific")
+        
+        g = IgnorableOptionGroup(parser, "Physiological parameters (all have default values from literature)")
         g.add_option("--bat", help="Estimated bolus arrival time (s) - default=0.7 (pASL), 1.3 (cASL)", type=float)
-        g.add_option("--batsd", help="Bolus arrival time standard deviation (s)", type=float)
-        g.add_option("--t1", help="Tissue T1 (s)", type=float, default=1.3)
+        g.add_option("--t1", "--t1t", help="Tissue T1 (s)", type=float, default=1.3)
+        g.add_option("--t2", "--t2t", help="Tissue T2 (ms)", type=float, default=50)
+        g.add_option("--t2s", help="Tissue T2* (ms)", type=float, default=20)
         g.add_option("--t1b", help="Blood T1 (s)", type=float, default=1.65)
+        g.add_option("--t2b", help="Blood T2 (ms) - Lu et al. 2012 MRM 67:42-49, 3T during normoxia", type=float, default=150)
+        g.add_option("--t2sb", help="Blood T2* (ms) - Petersen 2006 MRM 55(2):219-232", type=float, default=50)
         ret.append(g)
+
         g = IgnorableOptionGroup(parser, "Output options")
         g.add_option("--save-corrected", help="Save corrected input data", action="store_true", default=False)
         g.add_option("--save-reg", help="Save registration information (transforms etc)", action="store_true", default=False)
@@ -137,6 +153,7 @@ def main():
     Entry point for oxasl command line tool
     """
     debug = True
+    wsp = None
     try:
         parser = AslOptionParser(usage="oxasl -i <asl_image> [options]", version=__version__)
         parser.add_category(image.AslImageOptions())
@@ -151,6 +168,8 @@ def main():
             parser.add_category(oxasl_mp.MultiphaseOptions())
         if oxasl_enable:
             parser.add_category(oxasl_enable.EnableOptions(ignore=["regfrom",]))
+        if oxasl_multite:
+            parser.add_category(oxasl_multite.MultiTEOptions())
         parser.add_category(GenericOptions())
 
         options, _ = parser.parse_args()
@@ -183,6 +202,9 @@ def main():
         sys.stderr.write("ERROR: " + str(e) + "\n")
         if debug:
             traceback.print_exc()
+        if wsp is not None:
+            wsp.log.write("ERROR: " + str(e) + "\n")
+            wsp.log.write(traceback.format_exc() + "\n")
         sys.exit(1)
 
 def oxasl(wsp):
@@ -190,7 +212,7 @@ def oxasl(wsp):
     Main oxasl pipeline script
     """
     wsp.log.write("OXASL version: %s\n" % __version__)
-    for plugin in (oxasl_ve, oxasl_mp, oxasl_deblur, oxasl_enable, oxasl_surfpvc):
+    for plugin in (oxasl_ve, oxasl_mp, oxasl_deblur, oxasl_enable, oxasl_surfpvc, oxasl_multite):
         if plugin is not None:
             wsp.log.write(" - Found plugin: %s (version %s)\n" % (plugin.__name__, getattr(plugin, "__version__", "unknown")))
 
@@ -201,7 +223,13 @@ def oxasl(wsp):
     calib.init(wsp)
 
     if wsp.asldata.iaf in ("tc", "ct", "diff"):
-        model_paired(wsp)
+        if wsp.ntes == 1:
+            model_basil(wsp)
+        elif oxasl_multite is None:
+            raise ValueError("Multi-TE data supplied but oxasl_multite is not installed")
+        else:
+            oxasl_multite.model_multite(wsp)
+
     elif wsp.asldata.iaf in ("ve", "vediff"):
         if oxasl_ve is None:
             raise ValueError("Vessel encoded data supplied but oxasl_ve is not installed")
@@ -244,6 +272,9 @@ def oxasl_preproc(wsp):
     This method requires wsp to be a Workspace containing certain standard information.
     As a minimum, the attribute ``asldata`` must contain an AslImage object.
     """
+    if wsp.calib_first_vol and wsp.calib is None:
+        wsp.calib = wsp.asldata.calib
+
     report_asl(wsp)
 
     struc.init(wsp)
@@ -267,7 +298,7 @@ def oxasl_preproc(wsp):
         oxasl_enable.enable(wsp.enable)
         wsp.corrected.asldata = wsp.enable.asldata_enable
 
-def model_paired(wsp):
+def model_basil(wsp):
     """
     Do model fitting on TC/CT or subtracted data
 
@@ -280,6 +311,8 @@ def model_paired(wsp):
      - ``output.native`` - Native (ASL) space output from last Basil modelling output
      - ``output.struc``  - Structural space output
     """
+    wsp.basil_options = wsp.ifnone("basil_options", {})
+
     basil.basil(wsp, output_wsp=wsp.sub("basil"))
     redo_reg(wsp, wsp.basil.finalstep.mean_ftiss)
 
@@ -287,7 +320,10 @@ def model_paired(wsp):
     output_native(wsp.output, wsp.basil)
     output_trans(wsp.output)
 
-    if wsp.pvcorr or wsp.surf_pvcorr:
+    # If the user has provided manual PV maps (pvgm and pvgm) then do PVEc, even if they
+    # have not explicitly given the --pvcorr option 
+    user_pv_flag = ((wsp.pvwm is not None) and (wsp.pvgm is not None))
+    if (wsp.pvcorr) or (wsp.surf_pvcorr) or user_pv_flag:
         # Partial volume correction is very sensitive to the mask, so recreate it
         # if it came from the structural image as this requires accurate ASL->Struc registration
         if wsp.rois.mask_src == "struc":
@@ -295,35 +331,47 @@ def model_paired(wsp):
             wsp.rois.mask = None
             mask.generate_mask(wsp)
 
-        if wsp.pvcorr:
+        if wsp.pvcorr or user_pv_flag:
             # Do partial volume correction fitting
             #
             # FIXME: We could at this point re-apply all corrections derived from structural space?
             # But would need to make sure corrections module re-transforms things like sensitivity map
             
             # Prepare GM and WM partial volume maps from FAST segmentation
-            struc.segment(wsp)
-            wsp.structural.wm_pv_asl = reg.struc2asl(wsp, wsp.structural.wm_pv)
-            wsp.structural.gm_pv_asl = reg.struc2asl(wsp, wsp.structural.gm_pv)
+            if user_pv_flag:
+                wsp.log.write("\nUsing user-supplied PV estimates\n")
+                wsp.structural.wm_pv_asl = wsp.pvwm
+                wsp.structural.gm_pv_asl = wsp.pvgm
+            else:
+                struc.segment(wsp)
+                wsp.structural.wm_pv_asl = reg.struc2asl(wsp, wsp.structural.wm_pv)
+                wsp.structural.gm_pv_asl = reg.struc2asl(wsp, wsp.structural.gm_pv)
 
-            wsp.basil_options = wsp.ifnone("basil_options", {})
-            wsp.basil_options.update({"pwm" : wsp.structural.wm_pv_asl, "pgm" : wsp.structural.gm_pv_asl})
+            wsp.basil_options.update({"pwm" : wsp.structural.wm_pv_asl, 
+                                      "pgm" : wsp.structural.gm_pv_asl})
             basil.basil(wsp, output_wsp=wsp.sub("basil_pvcorr"), prefit=False)
 
             wsp.sub("output_pvcorr")
             output_native(wsp.output_pvcorr, wsp.basil_pvcorr)
-            output_trans(wsp.output_pvcorr)    
+            output_trans(wsp.output_pvcorr)
 
         if wsp.surf_pvcorr:
             if oxasl_surfpvc is None:
                 raise RuntimeError("Surface-based PVC requested but oxasl_surfpvc is not installed")
-                
+            if user_pv_flag:
+                wsp.log.write(" - WARNING: Performing surface based PVC ignores user-specified PV maps\n")
             # Prepare GM and WM partial volume maps from surface using Toblerone plugin
+            # Then reform the ASL ROI mask - Toblerone does not handle the cerebellum so need
+            # to mask it out
             oxasl_surfpvc.prepare_surf_pvs(wsp)
+            wsp.rois.mask_pvcorr = wsp.rois.mask
+            min_pv = 0.01
+            new_roi = (wsp.basil_options["pwm"].data > min_pv) | (wsp.basil_options["pgm"].data > min_pv)
+            wsp.rois.mask = Image(new_roi.astype(np.int8), header=wsp.rois.mask_pvcorr.header)
             basil.basil(wsp, output_wsp=wsp.sub("basil_surf_pvcorr"), prefit=False)
 
-            wsp.output.sub('output_surf_pvcorr')
-            output_native(wsp.output_surf_pvcorr, wsp.basil_surf_pvcorr)   
+            wsp.sub('output_surf_pvcorr')
+            output_native(wsp.output_surf_pvcorr, wsp.basil_surf_pvcorr)
             output_trans(wsp.output_surf_pvcorr)
 
 def redo_reg(wsp, pwi):
@@ -394,8 +442,9 @@ def output_native(wsp, basil_wsp, report=None):
 
             img = basil_wsp.finalstep.ifnone(fabber_output, None)
             if img is not None:
-                # Make negative values = 0 and ensure masked value zeroed
+                # Make negative/nan values = 0 and ensure masked value zeroed
                 data = np.copy(img.data)
+                data[~np.isfinite(data)] = 0
                 data[img.data < 0] = 0
                 data[wsp.rois.mask.data == 0] = 0
                 img = Image(data, header=img.header)
@@ -471,21 +520,36 @@ def output_trans(wsp):
     """
     Create transformed output, i.e. in structural and/or standard space
 
-    FIXME std space not implemented yet
+    FIXME ugly code duplication
     """
-    if not wsp.output_struc or wsp.reg.asl2struc is None:
-        return
+    if wsp.output_struc and wsp.reg.asl2struc is not None:
+        wsp.log.write("\nGenerating output in structural space\n")
+        wsp.sub("struct")
+        for suffix in ("", "_std", "_var", "_calib", "_std_calib", "_var_calib"):
+            for output in ("perfusion", "aCBV", "arrival", "perfusion_wm", "arrival_wm", "modelfit", "mask"):
+                native_output = getattr(wsp.native, output + suffix)
+                # Don't transform 4D output (e.g. modelfit) - too large!
+                if native_output is not None and native_output.ndim == 3:
+                    if wsp.reg.asl2struc is not None:
+                        setattr(wsp.struct, output + suffix, reg.asl2struc(wsp, native_output, mask=(output == 'mask')))
+        wsp.log.write(" - DONE\n")
 
-    wsp.log.write("\nGenerating output in structural space\n")
-    wsp.sub("struct")
-    for suffix in ("", "_std", "_var", "_calib", "_std_calib", "_var_calib"):
-        for output in ("perfusion", "aCBV", "arrival", "perfusion_wm", "arrival_wm", "modelfit", "mask"):
-            native_output = getattr(wsp.native, output + suffix)
-            # Don't transform 4D output (e.g. modelfit) - too large!
-            if native_output is not None and native_output.ndim == 3:
-                if wsp.reg.asl2struc is not None:
-                    setattr(wsp.struct, output + suffix, reg.asl2struc(wsp, native_output, mask=(output == 'mask')))
-    wsp.log.write(" - DONE\n")
+    if wsp.output_mni:
+        wsp.log.write("\nGenerating output in standard (MNI) space\n")
+        if wsp.reg.struc2asl is None:
+            wsp.log.write(" - WARNING: No structural registration - cannot output in standard space\n")
+        else:
+            reg.reg_struc2std(wsp)
+            wsp.sub("mni")
+            for suffix in ("", "_std", "_var", "_calib", "_std_calib", "_var_calib"):
+                for output in ("perfusion", "aCBV", "arrival", "perfusion_wm", "arrival_wm", "modelfit", "mask"):
+                    native_output = getattr(wsp.native, output + suffix)
+                    # Don't transform 4D output (e.g. modelfit) - too large!
+                    if native_output is not None and native_output.ndim == 3:
+                        struc_output = reg.asl2struc(wsp, native_output, mask=(output == 'mask'))
+                        setattr(wsp.mni, output + suffix, reg.struc2std(wsp, struc_output))
+
+            wsp.log.write(" - DONE\n")
 
 def do_cleanup(wsp):
     """

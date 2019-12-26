@@ -66,7 +66,7 @@ class DistcorrOptions(OptionCategory):
         g = IgnorableOptionGroup(parser, "General distortion correction options")
         g.add_option("--echospacing", help="Effective EPI echo spacing (sometimes called dwell time) - in seconds", type=float)
         g.add_option("--pedir", help="Phase encoding direction, dir = x/y/z/-x/-y/-z")
-        g.add_option("--gdcwarp", help="Additional warp image for gradient distortion correction - will be combined with fieldmap or TOPUP distortion correction", type="image")
+        g.add_option("--gdc-warp", "--gdcwarp", help="Additional warp image for gradient distortion correction - will be combined with fieldmap or TOPUP distortion correction", type="image")
         ret.append(g)
 
         g = IgnorableOptionGroup(parser, "Sensitivity correction")
@@ -77,9 +77,12 @@ class DistcorrOptions(OptionCategory):
         g.add_option("--senscorr-off", help="Do not apply any sensitivity correction", action="store_true", default=False)
         ret.append(g)
 
-        g = IgnorableOptionGroup(parser, "Partial volume correction")
-        g.add_option("--pvcorr", help="Apply partial volume correction", action="store_true", default=False)
-        g.add_option("--surf-pvcorr", help="Apply SURFACE PVEc, not mutually exclusive with --pvcorr", action="store_true", default=False)
+        g = IgnorableOptionGroup(parser, "Partial volume correction (PVEc)")
+        g.add_option("--pvcorr", help="Apply PVEc using FAST estimates taken from --fslanat dir", action="store_true", default=False)
+        g.add_option("--surf-pvcorr", help="Apply PVEc using surface PV estimates taken from --fslanat dir w/ surfaces (not mutually exclusive with --pvcorr)", action="store_true", default=False)
+        g.add_option('--cores', help="Number of processor cores to use for --surf-pvcorr", type=int)
+        g.add_option("--pvgm", help="GM PV estimates in ASL space (apply PVEc only, don't estimate PVs)", type="image", default=None)
+        g.add_option("--pvwm", help="As above, WM PV estimates in ASL space", type="image", default=None)
         ret.append(g)
 
         return ret
@@ -444,6 +447,8 @@ def apply_corrections(wsp):
      - ``cref``       : Corrected calibration reference image
      - ``cblip``      : Corrected calibration BLIP image
     """
+    reg.init(wsp)
+
     wsp.log.write("\nApplying preprocessing corrections\n")
     if wsp.corrected is None:
         wsp.sub("corrected")
@@ -487,16 +492,19 @@ def apply_corrections(wsp):
         wsp.corrected.jacobian = Image(jacobian.data, header=wsp.corrected.total_warp.header)
 
     if not warps and moco_mats is None:
-        wsp.log.write("   - No corrections to apply\n")
+        wsp.log.write("   - No corrections to apply to ASL data\n")
     else:
         # Apply all corrections to ASL data - note that we make sure the output keeps all the ASL metadata
-        wsp.log.write("   - Applying to ASL data\n")
+        wsp.log.write("   - Applying corrections to ASL data\n")
         asldata_corr = correct_img(wsp, wsp.input.asldata, moco_mats)
         wsp.corrected.asldata = wsp.input.asldata.derived(asldata_corr.data)
 
-        # Apply corrections to calibration images
-        if wsp.input.calib is not None:
-            wsp.log.write("   - Applying to calibration data\n")
+    if wsp.input.calib is not None:
+        # Apply corrections to calibration images if we have calib2asl registration or any other correction
+        if not warps and moco_mats is None and wsp.reg.calib2asl is None:
+            wsp.log.write("   - No corrections to apply to calibration data\n")
+        else:
+            wsp.log.write("   - Applying corrections to calibration data\n")
             wsp.corrected.calib = correct_img(wsp, wsp.corrected.calib, wsp.reg.calib2asl)
 
             if wsp.cref is not None:
@@ -565,9 +573,9 @@ def correct_img(wsp, img, linear_mat):
     else:
         img = reg.transform(wsp, img, trans=linear_mat, ref=wsp.nativeref)
 
-    if wsp.corrected.total_jacobian is not None:
+    if wsp.corrected.jacobian is not None:
         wsp.log.write("   - Correcting for local volume scaling using Jacobian\n")
-        jdata = wsp.corrected.total_jacobian.data
+        jdata = wsp.corrected.jacobian.data
         if img.data.ndim == 4:
             # Required to make broadcasting work
             jdata = jdata[..., np.newaxis]
